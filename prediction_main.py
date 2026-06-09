@@ -18,7 +18,7 @@ Blood Demand Prediction AI Service
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import List, Optional
+from typing import List, Optional, Union
 import math
 from datetime import datetime, timedelta
 from dataclasses import dataclass, field
@@ -37,49 +37,63 @@ app.add_middleware(
 
 # ─── Constants ────────────────────────────────────────────────────────────────
 
-LAGS        = [1, 2, 3, 7]   # أيام اللي بنرجع ليها كـ features
-ROLL_WINDOW = 7               # نافذة المتوسط المتحرك
-MIN_POINTS  = 35              # أقل عدد أيام عشان ندرّب موديل ML بأمانة
+LAGS         = [1, 2, 3, 7]
+ROLL_WINDOW  = 7
+MIN_POINTS   = 35
 RANDOM_STATE = 42
+
+# تحويل BloodType enum (int) لاسم مقروء
+# عدّل الأرقام حسب الـ enum في الـ .NET بتاعك
+BLOOD_TYPE_LABELS = {
+    1: "A+", 2: "A-", 3: "B+",  4: "B-",
+    5: "AB+", 6: "AB-", 7: "O+", 8: "O-",
+}
+
+def label_blood_type(value) -> str:
+    """بتحوّل BloodType من int لاسم مقروء. لو string بترجعها زي ما هي."""
+    try:
+        return BLOOD_TYPE_LABELS.get(int(value), str(value))
+    except (ValueError, TypeError):
+        return str(value)
 
 # ─── Models ───────────────────────────────────────────────────────────────────
 
 class InventoryLogItem(BaseModel):
-    blood_type: str      # "A+", "O-", ...
-    change_amount: int   # سالب = استهلاك (دم خرج) / موجب = توريد (دم دخل)
-    changed_at: str      # ISO datetime string  "2026-01-15T10:00:00"
+    blood_type:    Union[int, str]   # int enum من الداتابيز أو str ("A+")
+    change_amount: int               # سالب = استهلاك / موجب = توريد
+    changed_at:    str               # ISO datetime string
 
 class BloodBagItem(BaseModel):
-    blood_type: str
-    expiry_date: Optional[str] = None   # ISO datetime string أو None
+    blood_type:  Union[int, str]        # int enum من الداتابيز أو str ("A+")
+    expiry_date: Optional[str] = None  # ISO datetime string أو None
 
 class PredictRequest(BaseModel):
-    hospital_id: int
-    inventory_logs: List[InventoryLogItem]  # من جدول InventoryLogs
-    blood_bags: List[BloodBagItem]          # من جدول BloodBags (Status=Available فقط)
-    horizon_days: Optional[int] = 7        # الفترة المطلوب التنبؤ بها
+    hospital_id:    int
+    inventory_logs: List[InventoryLogItem]
+    blood_bags:     List[BloodBagItem]
+    horizon_days:   Optional[int] = 7
 
 class BloodTypePrediction(BaseModel):
-    blood_type: str
-    method: str                          # ml_random_forest | statistical_fallback
-    predicted_total: float               # إجمالي الاستهلاك المتوقّع خلال الفترة
-    predicted_per_day: List[float]       # توزيع يومي
-    accuracy_percent: Optional[float]    # None لو الداتا قليلة (مش بنخترع رقم)
-    mae: Optional[float]
-    rmse: Optional[float]
-    mape: Optional[float]
-    current_stock: float                 # عدد الأكياس المتاحة الصالحة
-    days_of_coverage: Optional[float]    # المخزون يكفي كام يوم
-    shortage_expected: bool              # هل المخزون أقل من المتوقّع؟
+    blood_type:        str
+    method:            str
+    predicted_total:   float
+    predicted_per_day: List[float]
+    accuracy_percent:  Optional[float]
+    mae:               Optional[float]
+    rmse:              Optional[float]
+    mape:              Optional[float]
+    current_stock:     float
+    days_of_coverage:  Optional[float]
+    shortage_expected: bool
 
 class PredictResponse(BaseModel):
-    hospital_id: int
-    horizon_days: int
-    demand_level: str                        # Low | Medium | High
-    total_expected_units: float              # مجموع كل الفصايل
+    hospital_id:              int
+    horizon_days:             int
+    demand_level:             str
+    total_expected_units:     float
     overall_accuracy_percent: Optional[float]
-    warnings: List[str]
-    predictions: List[BloodTypePrediction]   # مرتبة حسب الاستهلاك تنازلياً
+    warnings:                 List[str]
+    predictions:              List[BloodTypePrediction]
 
 # ─── Current Stock from BloodBags ─────────────────────────────────────────────
 
@@ -90,10 +104,9 @@ def calc_current_stock(blood_bags: List[BloodBagItem]) -> dict:
     الأكياس المنتهية صلاحيتها بتتستبعد.
     """
     stock = {}
-    now = datetime.utcnow()
+    now   = datetime.utcnow()
 
     for bag in blood_bags:
-        # استبعاد المنتهية الصلاحية
         if bag.expiry_date:
             try:
                 exp = datetime.fromisoformat(bag.expiry_date.replace("Z", ""))
@@ -102,7 +115,7 @@ def calc_current_stock(blood_bags: List[BloodBagItem]) -> dict:
             except ValueError:
                 pass
 
-        bt = bag.blood_type.strip()
+        bt = label_blood_type(bag.blood_type)   # ← تحويل int → "A+" مثلاً
         stock[bt] = stock.get(bt, 0) + 1
 
     return stock
@@ -112,15 +125,15 @@ def calc_current_stock(blood_bags: List[BloodBagItem]) -> dict:
 def build_daily_consumption(logs: List[InventoryLogItem], blood_type: str):
     """
     بيبني سلسلة استهلاك يومية لفصيلة معيّنة.
-    الاستهلاك = مجموع القيم السالبة في change_amount (الدم اللي خرج).
-    الأيام اللي مفيهاش حركة بتتملي بصفر عشان السلسلة تفضل متصلة.
+    الاستهلاك = مجموع القيم السالبة في change_amount.
+    الأيام اللي مفيهاش حركة بتتملي بصفر.
     """
     daily = {}
     for log in logs:
-        if log.blood_type.strip() != blood_type:
+        if label_blood_type(log.blood_type) != blood_type:   # ← تحويل هنا كمان
             continue
         if log.change_amount >= 0:
-            continue  # توريد مش استهلاك — بنشيله
+            continue
 
         try:
             day = datetime.fromisoformat(log.changed_at.replace("Z", "")).date()
@@ -144,12 +157,6 @@ def build_daily_consumption(logs: List[InventoryLogItem], blood_type: str):
 # ─── Feature Engineering ──────────────────────────────────────────────────────
 
 def _feature_row(values: list, dates: list, i: int) -> dict:
-    """
-    بيبني صف features للنقطة رقم i:
-      - lag_1, lag_2, lag_3, lag_7  →  استهلاك أيام فاتوا
-      - roll_mean_7                  →  متوسط آخر 7 أيام
-      - dow_0 .. dow_6               →  يوم الأسبوع (one-hot)
-    """
     row = {}
     for lag in LAGS:
         row[f"lag_{lag}"] = values[i - lag]
@@ -161,7 +168,6 @@ def _feature_row(values: list, dates: list, i: int) -> dict:
 
 
 def _build_xy(values: list, dates: list):
-    """بيبني الـ feature matrix X والـ target vector y للتدريب."""
     start_idx = max(max(LAGS), ROLL_WINDOW)
     rows, targets = [], []
     for i in range(start_idx, len(values)):
@@ -172,10 +178,6 @@ def _build_xy(values: list, dates: list):
 # ─── Accuracy Metrics ─────────────────────────────────────────────────────────
 
 def _calc_metrics(y_true, y_pred) -> dict:
-    """
-    بيحسب MAE / RMSE / MAPE / accuracy% على الـ test set.
-    MAPE بيتحسب على الأيام اللي الاستهلاك فيها > 0 بس (عشان نتجنب قسمة على صفر).
-    """
     y_true = np.asarray(y_true, dtype=float)
     y_pred = np.asarray(y_pred, dtype=float)
 
@@ -200,7 +202,7 @@ def _calc_metrics(y_true, y_pred) -> dict:
 
 @dataclass
 class BloodTypeForecaster:
-    blood_type: str
+    blood_type:  str
     model:       object = None
     method:      str    = "ml_random_forest"
     metrics:     dict   = field(default_factory=dict)
@@ -208,37 +210,27 @@ class BloodTypeForecaster:
     last_dates:  list   = field(default_factory=list)
 
     def fit(self, dates: list, values: list) -> "BloodTypeForecaster":
-        """
-        بيدرّب الموديل ويحسب الدقة.
-        لو الداتا أقل من MIN_POINTS → ينزل على طريقة إحصائية
-        من غير ما يخترع رقم دقة.
-        """
         self.last_dates, self.last_values = dates, values
 
         if len(values) < MIN_POINTS:
-            # ── داتا قليلة: statistical fallback ──────────────────────
             self.method  = "statistical_fallback"
             self.model   = None
             self.metrics = {"mae": None, "rmse": None,
                             "mape": None, "accuracy_percent": None}
             return self
 
-        # ── داتا كافية: تدريب RandomForest ────────────────────────────
         X, y = _build_xy(values, dates)
 
-        # تقسيم زمني: آخر 20% للاختبار (بدون خلط — ده time series)
         test_size = max(5, int(0.2 * len(X)))
         X_train, X_test = X.iloc[:-test_size], X.iloc[-test_size:]
         y_train, y_test = y[:-test_size],      y[-test_size:]
 
-        # 1) موديل للتقييم (على الـ test set)
         eval_model = RandomForestRegressor(
             n_estimators=200, min_samples_leaf=2, random_state=RANDOM_STATE
         )
         eval_model.fit(X_train, y_train)
         self.metrics = _calc_metrics(y_test, eval_model.predict(X_test))
 
-        # 2) موديل نهائي (على كل الداتا للتنبؤ)
         self.model = RandomForestRegressor(
             n_estimators=200, min_samples_leaf=2, random_state=RANDOM_STATE
         )
@@ -252,51 +244,34 @@ class BloodTypeForecaster:
         return self._forecast_statistical(horizon_days)
 
     def _forecast_ml(self, horizon_days: int) -> list:
-        """
-        تنبؤ متسلسل: يتوقّع يوم، يضيفه للتاريخ، يستخدمه لتوقّع التالي.
-        """
         values = list(self.last_values)
         dates  = list(self.last_dates)
         preds  = []
-
         for _ in range(horizon_days):
             next_day = dates[-1] + timedelta(days=1)
             dates.append(next_day)
-            values.append(0.0)       # placeholder لبناء الـ feature row
+            values.append(0.0)
             i    = len(values) - 1
             row  = _feature_row(values, dates, i)
             pred = max(0.0, float(self.model.predict(pd.DataFrame([row]))[0]))
-            values[-1] = pred        # بنستبدل الـ placeholder بالتوقّع
+            values[-1] = pred
             preds.append(pred)
-
         return preds
 
     def _forecast_statistical(self, horizon_days: int) -> list:
-        """
-        طريقة إحصائية بسيطة للداتا القليلة:
-        متوسط آخر 14 يوم + اتجاه خطي مبسّط.
-        """
         vals  = self.last_values[-14:] if self.last_values else [0.0]
         base  = float(np.mean(vals)) if vals else 0.0
-
         if len(vals) >= 4:
             half  = len(vals) // 2
             trend = (np.mean(vals[half:]) - np.mean(vals[:half])) / max(1, half)
             trend = max(min(trend, base * 0.1), -(base * 0.1))
         else:
             trend = 0.0
-
         return [max(0.0, base + trend * (i + 1)) for i in range(horizon_days)]
 
 # ─── Demand Level ─────────────────────────────────────────────────────────────
 
 def calc_demand_level(total_units: float, horizon_days: int) -> str:
-    """
-    بيحسب مستوى الطلب بناءً على متوسط الاستهلاك اليومي:
-      Low    → أقل من 50 وحدة/يوم
-      Medium → من 50 لـ 100 وحدة/يوم
-      High   → أكتر من 100 وحدة/يوم
-    """
     daily_avg = total_units / max(1, horizon_days)
     if daily_avg < 50:
         return "Low"
@@ -314,18 +289,16 @@ def predict(request: PredictRequest):
       - inventory_logs → سجلات حركة المخزون (جدول InventoryLogs)
       - blood_bags     → أكياس الدم المتاحة (جدول BloodBags، Status=Available فقط)
       - horizon_days   → الفترة المطلوب التنبؤ بها (افتراضي 7 أيام)
-
-    ويرجع:
-      - التنبؤ بالاستهلاك لكل فصيلة
-      - دقة الموديل (أو None لو الداتا قليلة)
-      - حالة المخزون وكفايته
     """
     horizon  = request.horizon_days or 7
     stock    = calc_current_stock(request.blood_bags)
     warnings = []
 
-    # اجمع الفصايل الموجودة في السجلات
-    blood_types_in_logs = list({log.blood_type.strip() for log in request.inventory_logs})
+    # اجمع الفصايل بعد تحويل الـ int → string
+    blood_types_in_logs = list({
+        label_blood_type(log.blood_type)   # ← تحويل هنا
+        for log in request.inventory_logs
+    })
 
     predictions = []
     for bt in blood_types_in_logs:
@@ -334,12 +307,10 @@ def predict(request: PredictRequest):
         if not values:
             continue
 
-        # ── تدريب الموديل وحساب الدقة ──────────────────────────────────
         fc      = BloodTypeForecaster(blood_type=bt).fit(dates, values)
         per_day = fc.forecast(horizon)
         total   = round(sum(per_day), 2)
 
-        # ── حساب حالة المخزون ──────────────────────────────────────────
         cur_stock = float(stock.get(bt, 0))
         avg_daily = total / horizon
         days_cov  = round(cur_stock / avg_daily, 1) if avg_daily > 0 else None
@@ -365,10 +336,8 @@ def predict(request: PredictRequest):
             shortage_expected=shortage,
         ))
 
-    # رتب تنازلياً حسب الاستهلاك (الأكثر احتياجاً الأول)
     predictions.sort(key=lambda x: x.predicted_total, reverse=True)
 
-    # ── مقاييس كلية ────────────────────────────────────────────────────
     total_units = sum(p.predicted_total for p in predictions)
     accs        = [p.accuracy_percent for p in predictions
                    if p.accuracy_percent is not None]
