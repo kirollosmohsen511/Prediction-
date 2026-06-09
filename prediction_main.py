@@ -17,9 +17,9 @@ BloodType enum:
   uvicorn main:app --reload --port 8001
 """
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, validator
 from typing import List, Optional, Union
 import math
 from datetime import datetime, timedelta
@@ -65,15 +65,24 @@ def label_blood_type(value) -> str:
 # ─── Models ───────────────────────────────────────────────────────────────────
 
 class BloodBagItem(BaseModel):
-    blood_type:  Union[int, str]       # int enum من الداتابيز
-    status:      int                   # 0=Available / 1=Withdrawn
-    created_at:  str                   # ISO datetime
-    expiry_date: Optional[str] = None  # ISO datetime أو None
+    blood_type:    Union[int, str]       # int enum من الداتابيز
+    status:        int                   # 0=Available / 1=Withdrawn
+    created_at:    str                   # ISO datetime — تاريخ إنشاء الكيس
+    withdrawn_at:  Optional[str] = None  # ISO datetime — تاريخ السحب الفعلي
+    expiry_date:   Optional[str] = None  # ISO datetime أو None
 
 class PredictRequest(BaseModel):
-    hospital_id:  int
+    hospital_id:  int = Field(..., gt=0,
+                              description="معرّف المستشفى — لازم يكون موجود وأكبر من 0")
     blood_bags:   List[BloodBagItem]   # كل الأكياس (Status 0 و 1)
-    horizon_days: Optional[int] = 7
+    horizon_days: int  = Field(default=7, ge=1, le=180,
+                               description="الفترة بالأيام (1–180)")
+
+    @validator("blood_bags")
+    def bags_not_empty(cls, v):
+        if not v:
+            raise ValueError("blood_bags لازم تكون فيه أكياس — مفيش بيانات للمستشفى ده")
+        return v
 
 class BloodTypePrediction(BaseModel):
     blood_type:        str
@@ -131,7 +140,7 @@ def calc_current_stock(blood_bags: List[BloodBagItem]) -> dict:
 def build_daily_consumption(blood_bags: List[BloodBagItem], blood_type: str):
     """
     بيبني سلسلة استهلاك يومية من الأكياس المسحوبة (Status = 1).
-    بيستخدم created_at كتاريخ الكيس.
+    بيستخدم withdrawn_at (تاريخ السحب الفعلي)، أو created_at كـ fallback.
     كل كيس مسحوب = وحدة استهلاك واحدة.
     الأيام اللي مفيهاش سحب بتتملي بصفر.
     """
@@ -142,9 +151,11 @@ def build_daily_consumption(blood_bags: List[BloodBagItem], blood_type: str):
             continue
         if bag.status != USED_STATUS:
             continue
+        # بنستخدم withdrawn_at (تاريخ السحب الفعلي) لو موجود، وإلا created_at
+        date_str = bag.withdrawn_at or bag.created_at
         try:
-            day = datetime.fromisoformat(bag.created_at.replace("Z", "")).date()
-        except ValueError:
+            day = datetime.fromisoformat(date_str.replace("Z", "")).date()
+        except (ValueError, AttributeError):
             continue
         daily[day] = daily.get(day, 0) + 1
 
@@ -311,6 +322,24 @@ def predict(request: PredictRequest):
       - horizon_days → الفترة (افتراضي 7 أيام)
     """
     horizon  = request.horizon_days or 7
+
+    # ── التحقق إن المستشفى عنده بيانات ──────────────────────────────────────
+    if not request.blood_bags:
+        raise HTTPException(
+            status_code=404,
+            detail=f"المستشفى رقم {request.hospital_id} مفيش له بيانات أكياس دم"
+        )
+
+    used_bags = [b for b in request.blood_bags if b.status == USED_STATUS]
+    if not used_bags:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"المستشفى رقم {request.hospital_id} مفيش له سجلات سحب (status=1). "
+                f"الموديل محتاج تاريخ استهلاك عشان يتنبأ."
+            )
+        )
+
     stock    = calc_current_stock(request.blood_bags)
     warnings = []
 
