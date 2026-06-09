@@ -273,9 +273,9 @@ class BloodTypeForecaster:
 
 def calc_demand_level(total_units: float, horizon_days: int) -> str:
     daily_avg = total_units / max(1, horizon_days)
-    if daily_avg < 50:
+    if daily_avg < 25:
         return "Low"
-    elif daily_avg <= 100:
+    elif daily_avg <= 40:
         return "Medium"
     else:
         return "High"
