@@ -1,17 +1,16 @@
 """
 Blood Demand Prediction AI Service
 =====================================
-بيتنبأ باستهلاك الدم لكل فصيلة بناءً على التاريخ.
+مصدر البيانات الوحيد: جدول BloodBags
 
-العوامل:
-  - lag features   → استهلاك أيام فاتوا (1, 2, 3, 7, 14)
-  - rolling avg    → متوسط آخر 7 و 14 يوم
-  - rolling std    → تذبذب الاستهلاك
-  - day of week    → أنهي يوم في الأسبوع
-  - is_weekend     → هل يوم عطلة
-  - week_of_month  → أنهي أسبوع في الشهر
-  الموديل: RandomForest Regressor
-  الدقة: MAE / RMSE / MAPE (train-test split زمني حقيقي)
+  Status = 0 (Available)  → المخزون الحالي
+  Status = 1 (Withdrawn)  → تاريخ الاستهلاك (لتدريب الموديل)
+
+BloodType enum:
+  1=A+  2=A-  3=B+  4=B-  5=AB+  6=AB-  7=O+  8=O-
+
+الموديل: RandomForest Regressor
+الدقة:   MAE / RMSE / MAPE (train-test split زمني حقيقي)
 
 تشغيل:
   pip install -r requirements.txt
@@ -40,20 +39,24 @@ app.add_middleware(
 
 # ─── Constants ────────────────────────────────────────────────────────────────
 
-LAGS         = [1, 2, 3, 7, 14]   # ← أضفنا lag_14 لنمط الأسبوعين
-ROLL_WINDOWS = [7, 14]             # ← متوسط متحرك 7 و14 يوم
-MIN_POINTS   = 40                  # ← رفعناها لأن lag_14 محتاج داتا أكتر
+LAGS         = [1, 2, 3, 7, 14]
+ROLL_WINDOWS = [7, 14]
+MIN_POINTS   = 40
 RANDOM_STATE = 42
 
-# تحويل BloodType enum (int) لاسم مقروء
-# عدّل الأرقام حسب الـ enum في الـ .NET بتاعك
+AVAILABLE_STATUS = 0   # BloodBagStatus.Available  → مخزون
+USED_STATUS      = 1   # BloodBagStatus.Withdrawn  → استهلاك
+
+# BloodType enum بالظبط زي ما عندك في الـ .NET
 BLOOD_TYPE_LABELS = {
-    1: "A+", 2: "A-", 3: "B+",  4: "B-",
-    5: "AB+", 6: "AB-", 7: "O+", 8: "O-",
+    1: "A+",  2: "A-",
+    3: "B+",  4: "B-",
+    5: "AB+", 6: "AB-",
+    7: "O+",  8: "O-",
 }
 
 def label_blood_type(value) -> str:
-    """بتحوّل BloodType من int لاسم مقروء. لو string بترجعها زي ما هي."""
+    """بتحوّل BloodType int → اسم مقروء. لو string بترجعها زي ما هي."""
     try:
         return BLOOD_TYPE_LABELS.get(int(value), str(value))
     except (ValueError, TypeError):
@@ -61,49 +64,56 @@ def label_blood_type(value) -> str:
 
 # ─── Models ───────────────────────────────────────────────────────────────────
 
-class InventoryLogItem(BaseModel):
-    blood_type:    Union[int, str]
-    change_amount: int
-    changed_at:    str
-
 class BloodBagItem(BaseModel):
-    blood_type:  Union[int, str]
-    expiry_date: Optional[str] = None
+    blood_type:  Union[int, str]       # int enum من الداتابيز
+    status:      int                   # 0=Available / 1=Withdrawn
+    created_at:  str                   # ISO datetime
+    expiry_date: Optional[str] = None  # ISO datetime أو None
 
 class PredictRequest(BaseModel):
-    hospital_id:    int
-    inventory_logs: List[InventoryLogItem]
-    blood_bags:     List[BloodBagItem]
-    horizon_days:   Optional[int] = 7
+    hospital_id:  int
+    blood_bags:   List[BloodBagItem]   # كل الأكياس (Status 0 و 1)
+    horizon_days: Optional[int] = 7
 
 class BloodTypePrediction(BaseModel):
     blood_type:        str
-    method:            str
-    predicted_total:   float
-    predicted_per_day: List[float]
-    accuracy_percent:  Optional[float]
+    method:            str              # ml_random_forest | statistical_fallback
+    predicted_total:   float            # إجمالي الاستهلاك المتوقّع
+    predicted_per_day: List[float]      # توزيع يومي
+    accuracy_percent:  Optional[float]  # None لو الداتا قليلة
     mae:               Optional[float]
     rmse:              Optional[float]
     mape:              Optional[float]
-    current_stock:     float
-    days_of_coverage:  Optional[float]
+    current_stock:     float            # أكياس Available الصالحة
+    units_required:    float            # وحدات محتاج تطلبها
+    units_surplus:     float            # وحدات زيادة
+    days_of_coverage:  Optional[float]  # المخزون يكفي كام يوم
     shortage_expected: bool
 
 class PredictResponse(BaseModel):
     hospital_id:              int
     horizon_days:             int
-    demand_level:             str
+    demand_level:             str               # Low | Medium | High
     total_expected_units:     float
+    total_units_required:     float
     overall_accuracy_percent: Optional[float]
     warnings:                 List[str]
     predictions:              List[BloodTypePrediction]
 
-# ─── Current Stock from BloodBags ─────────────────────────────────────────────
+# ─── Current Stock ────────────────────────────────────────────────────────────
 
 def calc_current_stock(blood_bags: List[BloodBagItem]) -> dict:
+    """
+    بيحسب المخزون الحالي من الأكياس المتاحة (Status = 0).
+    الأكياس المنتهية صلاحيتها بتتستبعد.
+    كل كيس = وحدة واحدة.
+    """
     stock = {}
     now   = datetime.utcnow()
+
     for bag in blood_bags:
+        if bag.status != AVAILABLE_STATUS:
+            continue
         if bag.expiry_date:
             try:
                 exp = datetime.fromisoformat(bag.expiry_date.replace("Z", ""))
@@ -113,22 +123,30 @@ def calc_current_stock(blood_bags: List[BloodBagItem]) -> dict:
                 pass
         bt = label_blood_type(bag.blood_type)
         stock[bt] = stock.get(bt, 0) + 1
+
     return stock
 
-# ─── Series Builder ───────────────────────────────────────────────────────────
+# ─── Consumption History ──────────────────────────────────────────────────────
 
-def build_daily_consumption(logs: List[InventoryLogItem], blood_type: str):
+def build_daily_consumption(blood_bags: List[BloodBagItem], blood_type: str):
+    """
+    بيبني سلسلة استهلاك يومية من الأكياس المسحوبة (Status = 1).
+    بيستخدم created_at كتاريخ الكيس.
+    كل كيس مسحوب = وحدة استهلاك واحدة.
+    الأيام اللي مفيهاش سحب بتتملي بصفر.
+    """
     daily = {}
-    for log in logs:
-        if label_blood_type(log.blood_type) != blood_type:
+
+    for bag in blood_bags:
+        if label_blood_type(bag.blood_type) != blood_type:
             continue
-        if log.change_amount >= 0:
+        if bag.status != USED_STATUS:
             continue
         try:
-            day = datetime.fromisoformat(log.changed_at.replace("Z", "")).date()
+            day = datetime.fromisoformat(bag.created_at.replace("Z", "")).date()
         except ValueError:
             continue
-        daily[day] = daily.get(day, 0) + (-log.change_amount)
+        daily[day] = daily.get(day, 0) + 1
 
     if not daily:
         return [], []
@@ -139,49 +157,43 @@ def build_daily_consumption(logs: List[InventoryLogItem], blood_type: str):
         dates.append(current)
         values.append(float(daily.get(current, 0)))
         current += timedelta(days=1)
+
     return dates, values
 
-# ─── Feature Engineering (محسّنة) ────────────────────────────────────────────
+# ─── Feature Engineering ──────────────────────────────────────────────────────
 
 def _feature_row(values: list, dates: list, i: int) -> dict:
     """
-    بيبني صف features للنقطة رقم i.
-    Features محسّنة:
-      - lag_1, 2, 3, 7, 14   → استهلاك أيام فاتوا (أضفنا lag_14)
-      - roll_mean_7/14        → متوسط متحرك (أضفنا 14 يوم)
-      - roll_std_7/14         → تذبذب الاستهلاك (جديد)
-      - dow_0..6              → يوم الأسبوع (one-hot)
-      - is_weekend            → هل يوم عطلة (جديد)
-      - week_of_month         → أنهي أسبوع في الشهر (جديد)
+    Features:
+      lag_1, 2, 3, 7, 14   → استهلاك أيام فاتوا
+      roll_mean_7/14        → متوسط متحرك
+      roll_std_7/14         → تذبذب الاستهلاك
+      dow_0..6              → يوم الأسبوع (one-hot)
+      is_weekend            → هل عطلة
+      week_of_month         → أنهي أسبوع في الشهر
     """
     row = {}
 
-    # Lag features
     for lag in LAGS:
         row[f"lag_{lag}"] = values[i - lag]
 
-    # Rolling mean + std لكل نافذة
     for w in ROLL_WINDOWS:
         window = values[i - w:i]
         row[f"roll_mean_{w}"] = float(np.mean(window)) if window else 0.0
         row[f"roll_std_{w}"]  = float(np.std(window))  if len(window) > 1 else 0.0
 
-    # يوم الأسبوع (one-hot)
     dow = dates[i].weekday()
     for d in range(7):
         row[f"dow_{d}"] = 1.0 if d == dow else 0.0
 
-    # عطلة نهاية الأسبوع
-    row["is_weekend"] = 1.0 if dow >= 5 else 0.0
-
-    # أنهي أسبوع في الشهر (1-4)
+    row["is_weekend"]    = 1.0 if dow >= 5 else 0.0
     row["week_of_month"] = float((dates[i].day - 1) // 7 + 1)
 
     return row
 
 
 def _build_xy(values: list, dates: list):
-    start_idx = max(max(LAGS), max(ROLL_WINDOWS))  # ← 14 دلوقتي
+    start_idx = max(max(LAGS), max(ROLL_WINDOWS))
     rows, targets = [], []
     for i in range(start_idx, len(values)):
         rows.append(_feature_row(values, dates, i))
@@ -199,7 +211,7 @@ def _calc_metrics(y_true, y_pred) -> dict:
 
     mask = y_true > 0
     if mask.sum() > 0:
-        mape     = float(np.mean(np.abs((y_true[mask] - y_pred[mask]) / y_true[mask])) * 100)
+        mape     = float(np.mean(np.abs((y_true[mask]-y_pred[mask])/y_true[mask]))*100)
         accuracy = max(0.0, 100.0 - mape)
     else:
         mape, accuracy = None, None
@@ -211,7 +223,7 @@ def _calc_metrics(y_true, y_pred) -> dict:
         "accuracy_percent": round(accuracy, 2) if accuracy is not None else None,
     }
 
-# ─── Blood Type Forecaster ────────────────────────────────────────────────────
+# ─── Forecaster ───────────────────────────────────────────────────────────────
 
 @dataclass
 class BloodTypeForecaster:
@@ -228,42 +240,33 @@ class BloodTypeForecaster:
         if len(values) < MIN_POINTS:
             self.method  = "statistical_fallback"
             self.model   = None
-            self.metrics = {"mae": None, "rmse": None,
-                            "mape": None, "accuracy_percent": None}
+            self.metrics = {"mae":None,"rmse":None,"mape":None,"accuracy_percent":None}
             return self
 
         X, y = _build_xy(values, dates)
 
-        # تقسيم زمني: آخر 20% للاختبار
         test_size = max(5, int(0.2 * len(X)))
-        X_train, X_test = X.iloc[:-test_size], X.iloc[-test_size:]
-        y_train, y_test = y[:-test_size],      y[-test_size:]
+        X_tr, X_te = X.iloc[:-test_size], X.iloc[-test_size:]
+        y_tr, y_te = y[:-test_size],      y[-test_size:]
 
-        # موديل التقييم
-        eval_model = RandomForestRegressor(
-            n_estimators=300,        # ← زدنا من 200 لـ 300
-            min_samples_leaf=2,
-            max_features="sqrt",     # ← أضفنا لتحسين التعميم
-            random_state=RANDOM_STATE
+        eval_m = RandomForestRegressor(
+            n_estimators=300, min_samples_leaf=2,
+            max_features="sqrt", random_state=RANDOM_STATE
         )
-        eval_model.fit(X_train, y_train)
-        self.metrics = _calc_metrics(y_test, eval_model.predict(X_test))
+        eval_m.fit(X_tr, y_tr)
+        self.metrics = _calc_metrics(y_te, eval_m.predict(X_te))
 
-        # الموديل النهائي على كل الداتا
         self.model = RandomForestRegressor(
-            n_estimators=300,
-            min_samples_leaf=2,
-            max_features="sqrt",
-            random_state=RANDOM_STATE
+            n_estimators=300, min_samples_leaf=2,
+            max_features="sqrt", random_state=RANDOM_STATE
         )
         self.model.fit(X, y)
         self.method = "ml_random_forest"
         return self
 
     def forecast(self, horizon_days: int) -> list:
-        if self.model is not None:
-            return self._forecast_ml(horizon_days)
-        return self._forecast_statistical(horizon_days)
+        return self._forecast_ml(horizon_days) if self.model else \
+               self._forecast_statistical(horizon_days)
 
     def _forecast_ml(self, horizon_days: int) -> list:
         values = list(self.last_values)
@@ -271,11 +274,10 @@ class BloodTypeForecaster:
         preds  = []
         for _ in range(horizon_days):
             next_day = dates[-1] + timedelta(days=1)
-            dates.append(next_day)
-            values.append(0.0)
+            dates.append(next_day); values.append(0.0)
             i    = len(values) - 1
-            row  = _feature_row(values, dates, i)
-            pred = max(0.0, float(self.model.predict(pd.DataFrame([row]))[0]))
+            pred = max(0.0, float(self.model.predict(
+                pd.DataFrame([_feature_row(values, dates, i)]))[0]))
             values[-1] = pred
             preds.append(pred)
         return preds
@@ -293,31 +295,35 @@ class BloodTypeForecaster:
 
 # ─── Demand Level ─────────────────────────────────────────────────────────────
 
-def calc_demand_level(total_units: float, horizon_days: int) -> str:
-    daily_avg = total_units / max(1, horizon_days)
-    if daily_avg < 50:
-        return "Low"
-    elif daily_avg <= 100:
-        return "Medium"
-    else:
-        return "High"
+def calc_demand_level(total: float, horizon: int) -> str:
+    avg = total / max(1, horizon)
+    return "High" if avg > 100 else "Medium" if avg >= 50 else "Low"
 
 # ─── Main Endpoint ────────────────────────────────────────────────────────────
 
 @app.post("/predict", response_model=PredictResponse)
 def predict(request: PredictRequest):
+    """
+    يستقبل من الـ .NET:
+      - blood_bags  → كل أكياس الدم بتاعة المستشفى
+          Status=0  → Available  → المخزون الحالي
+          Status=1  → Withdrawn  → تاريخ الاستهلاك للتدريب
+      - horizon_days → الفترة (افتراضي 7 أيام)
+    """
     horizon  = request.horizon_days or 7
     stock    = calc_current_stock(request.blood_bags)
     warnings = []
 
-    blood_types_in_logs = list({
-        label_blood_type(log.blood_type)
-        for log in request.inventory_logs
+    # الفصايل اللي عندها سجلات سحب (Status=1)
+    blood_types = list({
+        label_blood_type(b.blood_type)
+        for b in request.blood_bags
+        if b.status == USED_STATUS
     })
 
     predictions = []
-    for bt in blood_types_in_logs:
-        dates, values = build_daily_consumption(request.inventory_logs, bt)
+    for bt in blood_types:
+        dates, values = build_daily_consumption(request.blood_bags, bt)
         if not values:
             continue
 
@@ -325,15 +331,17 @@ def predict(request: PredictRequest):
         per_day = fc.forecast(horizon)
         total   = round(sum(per_day), 2)
 
-        cur_stock = float(stock.get(bt, 0))
-        avg_daily = total / horizon
-        days_cov  = round(cur_stock / avg_daily, 1) if avg_daily > 0 else None
-        shortage  = cur_stock < total
+        cur_stock      = float(stock.get(bt, 0))
+        avg_daily      = total / horizon
+        days_cov       = round(cur_stock / avg_daily, 1) if avg_daily > 0 else None
+        shortage       = cur_stock < total
+        units_required = round(max(0.0, total - cur_stock), 2)
+        units_surplus  = round(max(0.0, cur_stock - total), 2)
 
         if fc.method == "statistical_fallback":
             warnings.append(
-                f"فصيلة {bt}: الداتا أقل من {MIN_POINTS} يوم — "
-                f"اُستخدمت طريقة إحصائية والدقة غير متاحة."
+                f"فصيلة {bt}: أقل من {MIN_POINTS} يوم سحب — "
+                f"طريقة إحصائية، الدقة غير متاحة."
             )
 
         predictions.append(BloodTypePrediction(
@@ -346,22 +354,25 @@ def predict(request: PredictRequest):
             rmse=fc.metrics.get("rmse"),
             mape=fc.metrics.get("mape"),
             current_stock=cur_stock,
+            units_required=units_required,
+            units_surplus=units_surplus,
             days_of_coverage=days_cov,
             shortage_expected=shortage,
         ))
 
-    predictions.sort(key=lambda x: x.predicted_total, reverse=True)
+    predictions.sort(key=lambda x: x.units_required, reverse=True)
 
     total_units = sum(p.predicted_total for p in predictions)
     accs        = [p.accuracy_percent for p in predictions
                    if p.accuracy_percent is not None]
-    overall_acc = round(sum(accs) / len(accs), 2) if accs else None
+    overall_acc = round(sum(accs)/len(accs), 2) if accs else None
 
     return PredictResponse(
         hospital_id=request.hospital_id,
         horizon_days=horizon,
         demand_level=calc_demand_level(total_units, horizon),
         total_expected_units=round(total_units, 2),
+        total_units_required=round(sum(p.units_required for p in predictions), 2),
         overall_accuracy_percent=overall_acc,
         warnings=warnings,
         predictions=predictions,
